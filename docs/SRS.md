@@ -1,274 +1,428 @@
-# **JDER**
-
-Software Requirements Specification
-
-Version 1.0 | Confidential
-
-# **1\. Introduction**
-
-## **1.1 Purpose**
-
-This Software Requirements Specification defines the functional and non-functional requirements for Jder, an India-specific job search aggregator platform. It is the technical reference for all system design, development, and testing decisions.
-
-## **1.2 System Overview**
-
-Jder is a microservice platform consisting of two primary codebases (Python services, Java services) and a Next.js frontend. It scrapes Indian job boards, normalises and indexes listings into Elasticsearch, and serves search and personalised recommendations to end users via a GraphQL API.
-
-## **1.3 Definitions**
-
-| **Term**    | **Definition**                                                                   |
-| ----------- | -------------------------------------------------------------------------------- |
-| Listing     | A normalised job posting stored in Elasticsearch                                 |
-| Raw event   | Unprocessed scraped data published to Kafka topic raw.jobs                       |
-| Clean event | Normalised job data published to Kafka topic clean.jobs                          |
-| CTC         | Cost to Company - Indian standard for annual salary                              |
-| ETL         | Extract, Transform, Load - the ingestion/normalisation pipeline                  |
-| gRPC        | Remote Procedure Call protocol using Protobuf for internal service communication |
-| DLQ         | Dead Letter Queue - Kafka topic for failed events after max retries              |
-
-# **2\. System Architecture**
-
-## **2.1 Services**
-
-| **Service**            | **Language** | **Runtime**    | **Responsibility**                                                       |
-| ---------------------- | ------------ | -------------- | ------------------------------------------------------------------------ |
-| API Gateway            | Java         | GraalVM Native | Single entry point. GraphQL federation. Auth enforcement. Rate limiting. |
-| User Service           | Java         | GraalVM Native | Auth, profiles, saved jobs, job alerts.                                  |
-| Search Service         | Java         | JVM            | Elasticsearch queries, geo filters, facets, caching.                     |
-| Notification Service   | Java         | JVM            | Email and push notifications via Kafka events.                           |
-| Crawler Service        | Python       | CPython        | Scrapes Naukri, Foundit, Internshala. Publishes to raw.jobs.             |
-| Ingestion/ETL          | Python       | CPython        | Normalises, deduplicates, publishes to clean.jobs.                       |
-| Recommendation Service | Python       | CPython        | Two-stage retrieve and re-rank personalised recommendations.             |
-
-## **2.2 Communication Protocols**
-
-- External (client to gateway): GraphQL over HTTPS
-- Internal synchronous (service to service): gRPC with Protobuf
-- Internal asynchronous (pipeline and events): Apache Kafka
-
-## **2.3 Data Stores**
-
-| **Store**     | **Usage**                                              | **Managed By**                           |
-| ------------- | ------------------------------------------------------ | ---------------------------------------- |
-| Elasticsearch | Job listings, full-text search, geo queries            | Elastic Cloud (India region)             |
-| PostgreSQL    | Users, alerts, tracking - schema-per-service isolation | Railway (Phase 1), RDS (Phase 2)         |
-| Redis         | Search cache, sessions, Celery broker, rate limiting   | Railway (Phase 1), ElastiCache (Phase 2) |
-| Apache Kafka  | raw.jobs, clean.jobs, user.events pipelines            | Upstash (Phase 1), MSK (Phase 2)         |
-
-# **3\. Functional Requirements**
-
-## **3.1 Crawler Service**
-
-| **ID**    | **Category** | **Requirement**                                                                   | **Priority** |
-| --------- | ------------ | --------------------------------------------------------------------------------- | ------------ |
-| **CR-01** | Crawling     | System shall crawl Naukri.com every 4 hours                                       | P0           |
-| **CR-02** | Crawling     | System shall crawl Foundit every 6 hours                                          | P0           |
-| **CR-03** | Crawling     | System shall crawl Internshala every 12 hours                                     | P0           |
-| **CR-04** | Crawling     | Crawler shall use Playwright with stealth plugin to avoid bot detection           | P0           |
-| **CR-05** | Crawling     | Crawler shall rotate residential proxy IPs per session                            | P0           |
-| **CR-06** | Crawling     | Crawler shall publish a raw event to Kafka topic raw.jobs for every listing found | P0           |
-| **CR-07** | Reliability  | Crawler shall enter exponential backoff after 3 consecutive failures per source   | P0           |
-| **CR-08** | Reliability  | Crawler shall alert via Sentry when any source fails for more than 1 hour         | P1           |
-
-## **3.2 Ingestion / ETL Service**
-
-| **ID**    | **Category**  | **Requirement**                                                                           | **Priority** |
-| --------- | ------------- | ----------------------------------------------------------------------------------------- | ------------ |
-| **ET-01** | Normalisation | System shall normalise all salary variants to annual INR integer range {min, max}         | P0           |
-| **ET-02** | Normalisation | System shall map skill variants to canonical form (e.g. React.js, ReactJS -> React)       | P0           |
-| **ET-03** | Normalisation | System shall geocode all location strings to {city, state, lat, lng}                      | P0           |
-| **ET-04** | Normalisation | System shall resolve relative dates (e.g. '30+ Days Ago') to absolute timestamps          | P0           |
-| **ET-05** | Deduplication | System shall deduplicate by source_id within the same source                              | P0           |
-| **ET-06** | Deduplication | System shall deduplicate cross-source by company + title + location within a 7-day window | P0           |
-| **ET-07** | Deduplication | System shall use Redis bloom filter for fast first-pass deduplication check               | P1           |
-| **ET-08** | Pipeline      | System shall publish clean events to Kafka topic clean.jobs after normalisation           | P0           |
-| **ET-09** | Pipeline      | Failed events shall be published to raw.jobs.dlq after 3 retry attempts                   | P0           |
-
-## **3.3 Search Service**
-
-| **ID**    | **Category** | **Requirement**                                                                           | **Priority** |
-| --------- | ------------ | ----------------------------------------------------------------------------------------- | ------------ |
-| **SR-01** | Search       | System shall support full-text search across job title, skills, and description           | P0           |
-| **SR-02** | Search       | System shall support geo-distance filtering by city name or lat/lng + radius              | P0           |
-| **SR-03** | Search       | System shall support filtering by salary range (normalised INR)                           | P0           |
-| **SR-04** | Search       | System shall support filtering by experience range (years)                                | P0           |
-| **SR-05** | Search       | System shall support filtering by job type (full_time, contract, internship, remote)      | P0           |
-| **SR-06** | Search       | System shall support filtering by date posted (within N days)                             | P0           |
-| **SR-07** | Search       | System shall return faceted aggregations (city, job_type, salary range) with every result | P1           |
-| **SR-08** | Search       | Search results shall be ranked by relevance score with recency boost                      | P0           |
-| **SR-09** | Caching      | System shall cache frequent search queries in Redis with a 15-minute TTL                  | P1           |
-| **SR-10** | Pagination   | System shall support pagination via from/size for pages 1-10, search_after beyond         | P1           |
-
-## **3.4 User Service**
-
-| **ID**    | **Category** | **Requirement**                                                                             | **Priority** |
-| --------- | ------------ | ------------------------------------------------------------------------------------------- | ------------ |
-| **US-01** | Auth         | System shall support email and password registration                                        | P0           |
-| **US-02** | Auth         | System shall issue JWT tokens on successful login (24-hour expiry)                          | P0           |
-| **US-03** | Auth         | System shall issue refresh tokens (30-day expiry)                                           | P0           |
-| **US-04** | Auth         | API Gateway shall validate JWT on every request via gRPC call to User Service               | P0           |
-| **US-05** | Profile      | User shall be able to set skills, experience years, preferred locations, salary expectation | P1           |
-| **US-06** | Saved Jobs   | User shall be able to save and unsave job listings                                          | P1           |
-| **US-07** | Alerts       | User shall be able to create job alerts with search criteria                                | P1           |
-| **US-08** | Alerts       | System shall evaluate alerts against new clean.jobs events and trigger notifications        | P1           |
-
-## **3.5 Recommendation Service**
-
-| **ID**    | **Category**       | **Requirement**                                                                                    | **Priority** |
-| --------- | ------------------ | -------------------------------------------------------------------------------------------------- | ------------ |
-| **RC-01** | Retrieval          | System shall retrieve up to 200 candidate jobs from Search Service via gRPC                        | P1           |
-| **RC-02** | Ranking            | System shall re-rank candidates using skill similarity, recency, behaviour, and popularity signals | P1           |
-| **RC-03** | Embeddings         | System shall generate skill embeddings using sentence-transformers (all-MiniLM-L6-v2)              | P1           |
-| **RC-04** | Cold Start         | System shall fall back to profile-based matching for users with no behaviour history               | P1           |
-| **RC-05** | Caching            | Recommendation results shall be cached in Redis per user per page with 30-minute TTL               | P1           |
-| **RC-06** | Cache Invalidation | Cache shall be invalidated when user saves or applies to a job                                     | P1           |
-
-# **4\. Non-Functional Requirements**
-
-## **4.1 Performance**
-
-| **Requirement**                          | **Target**      | **Measurement**                           |
-| ---------------------------------------- | --------------- | ----------------------------------------- |
-| Search response time (p95)               | < 300ms         | End-to-end from gateway to client         |
-| Recommendation response time (p95, warm) | < 300ms         | Cache hit path                            |
-| Recommendation response time (p95, cold) | < 600ms         | Cache miss path                           |
-| Listing freshness                        | < 6 hours       | From crawl to searchable in Elasticsearch |
-| Kafka consumer lag (ingestion)           | < 1000 messages | Measured per partition                    |
-
-## **4.2 Reliability**
-
-- API Gateway uptime: > 99.5%
-- Crawler success rate per source: > 90% over any 24-hour window
-- No data loss on Ingestion service restart - Kafka offset management ensures replay
-- DLQ monitored - alert if more than 100 messages accumulate
-
-## **4.3 Security**
-
-- All client-gateway communication over HTTPS
-- JWT validation enforced at API Gateway for all authenticated endpoints
-- Secrets managed via Doppler - no secrets in version control
-- Internal services not publicly exposed - Railway internal DNS only
-- Rate limiting enforced at API Gateway via Redis counters
-
-## **4.4 Scalability**
-
-- All services containerised and horizontally scalable
-- Elasticsearch index sharded for query parallelism
-- Kafka partitions sized to allow up to 6 parallel ingestion consumers
-- Phase 2 migration to AWS EKS enables pod-level autoscaling via HPA
-
-# **5\. API Contracts**
-
-## **5.1 External GraphQL API**
-
-All client requests go through the API Gateway at a single /graphql endpoint. Key queries:
-
-searchJobs(input: SearchInput!): SearchResult!
-
-job(id: ID!): Job
-
-recommendations(limit: Int, offset: Int): RecommendationResult!
-
-similarJobs(jobId: ID!, limit: Int): \[Job!\]!
-
-me: User
-
-savedJobs: \[ID!\]!
-
-jobAlerts: \[JobAlert!\]!
-
-Key mutations:
-
-saveJob(jobId: ID!): Boolean!
-
-createAlert(input: CreateAlertInput!): JobAlert!
-
-updateProfile(input: UpdateProfileInput!): User!
-
-## **5.2 Internal gRPC Services**
-
-| **Proto Service**     | **Key RPCs**                                  | **Callers**                         |
-| --------------------- | --------------------------------------------- | ----------------------------------- |
-| SearchService         | SearchJobs, GetJob                            | API Gateway, Recommendation Service |
-| UserService           | GetUser, ValidateToken, SaveJob, GetSavedJobs | API Gateway                         |
-| RecommendationService | GetRecommendations, GetSimilarJobs            | API Gateway                         |
-
-## **5.3 Kafka Topics**
-
-| **Topic**    | **Producer**  | **Consumer**         | **Retention** |
-| ------------ | ------------- | -------------------- | ------------- |
-| raw.jobs     | Crawler       | Ingestion/ETL        | 7 days        |
-| clean.jobs   | Ingestion/ETL | Search Service       | 14 days       |
-| user.events  | User Service  | Notification Service | 3 days        |
-| raw.jobs.dlq | Ingestion/ETL | Manual review        | 30 days       |
-
-# **6\. Key Data Models**
-
-## **6.1 Elasticsearch Job Document**
-
-id: keyword
-
-title: text (job_title_analyzer)
-
-company: text + keyword
-
-skills: text (skill_analyzer) + keyword
-
-location.city: keyword
-
-location.state: keyword
-
-location.geo: geo_point
-
-location.remote: boolean
-
-salary.min: long (annual INR)
-
-salary.max: long (annual INR)
-
-experience.min: integer (years)
-
-experience.max: integer (years)
-
-job_type: keyword
-
-posted_at: date
-
-sources: keyword\[\]
-
-## **6.2 PostgreSQL Schemas**
-
-| **Schema**    | **Tables**                           |
-| ------------- | ------------------------------------ |
-| users         | users, refresh_tokens, user_profiles |
-| alerts        | job_alerts, alert_criteria           |
-| tracking      | saved_jobs, application_events       |
-| notifications | notification_log, email_queue        |
-
-# **7\. Infrastructure Requirements**
-
-## **7.1 Phase 1 - Railway**
-
-- All services deployed as Docker containers on Railway
-- PostgreSQL and Redis via Railway managed services
-- Kafka via Upstash managed Kafka
-- Elasticsearch via Elastic Cloud India region
-- Frontend deployed on Vercel
-- Secrets managed via Doppler synced to Railway environment variables
-
-## **7.2 CI/CD**
-
-- GitHub Actions per service - push triggers lint, test, build, deploy
-- GraalVM Native Image compilation in CI - expect 3 to 5 minutes per service
-- Docker images pushed to GitHub Container Registry
-- Separate workflows per service - no full rebuild on unrelated changes
-
-## **7.3 Observability**
-
-| **Concern**         | **Tool**                       |
-| ------------------- | ------------------------------ |
-| Distributed tracing | OpenTelemetry -> Grafana Tempo |
-| Metrics             | Prometheus + Grafana           |
-| Log aggregation     | Grafana Loki                   |
-| Error tracking      | Sentry (Java + Python SDKs)    |
-| Uptime monitoring   | Betterstack                    |
+# SRS — jder-platform
+
+**Repo:** `jder-platform`
+**Language:** Python
+**Services:** Crawler, Ingestion/ETL, Recommendation
+**Parent SRS:** JDER_SRS.docx (Master)
+**Version:** 1.0
+
+---
+
+## 1. Scope
+
+This document covers all Python services in `jder-platform`. It defines the functional requirements, data contracts, infrastructure, and testing expectations for:
+
+- `crawler/` — scrapes Indian job boards, produces to Kafka
+- `ingestion/` — consumes raw events, normalises, deduplicates, produces clean events
+- `recommendation/` — serves personalised job recommendations via FastAPI + gRPC
+
+---
+
+## 2. Repo Structure
+
+```
+jder-platform/
+├── docker-compose.yml
+├── pyproject.toml
+├── proto/
+│   └── search.proto
+│
+├── crawler/
+│   ├── Dockerfile
+│   ├── pyproject.toml
+│   ├── crawler/
+│   │   ├── main.py
+│   │   ├── tasks.py              # celery task definitions
+│   │   ├── config.py
+│   │   └── adapters/
+│   │       ├── base_adapter.py   # abstract base class
+│   │       ├── naukri.py
+│   │       ├── foundit.py
+│   │       └── internshala.py
+│   └── tests/
+│
+├── ingestion/
+│   ├── Dockerfile
+│   ├── pyproject.toml
+│   ├── ingestion/
+│   │   ├── main.py
+│   │   ├── consumer.py           # kafka consumer loop
+│   │   ├── deduplicator.py
+│   │   ├── config.py
+│   │   └── normalizers/
+│   │       ├── salary.py
+│   │       ├── skills.py
+│   │       ├── location.py
+│   │       └── date.py
+│   └── tests/
+│
+├── recommendation/
+│   ├── Dockerfile
+│   ├── pyproject.toml
+│   ├── recommendation/
+│   │   ├── main.py               # fastapi app
+│   │   ├── embeddings.py
+│   │   ├── ranker.py
+│   │   ├── collaborative.py
+│   │   ├── config.py
+│   │   └── proto_generated/      # generated grpc stubs
+│   └── tests/
+│
+└── shared/
+    ├── kafka_client.py
+    ├── schemas.py                 # pydantic models shared across services
+    └── proto_generated/
+```
+
+---
+
+## 3. Crawler Service
+
+### 3.1 Responsibilities
+
+- Schedule and execute scrape jobs against Indian job boards
+- Produce raw job events to Kafka topic `raw.jobs`
+- Track crawl state per source in Redis
+- Handle bot detection gracefully with retries and backoff
+
+### 3.2 Dependencies
+
+```
+playwright
+playwright-stealth
+celery
+redis
+kafka-python
+pydantic
+sentry-sdk
+```
+
+### 3.3 Functional Requirements
+
+| ID | Requirement | Priority |
+|---|---|---|
+| CR-01 | Crawl Naukri.com every 4 hours via Celery Beat schedule | P0 |
+| CR-02 | Crawl Foundit every 6 hours | P0 |
+| CR-03 | Crawl Internshala every 12 hours | P0 |
+| CR-04 | Use Playwright with playwright-stealth plugin on all crawlers | P0 |
+| CR-05 | Rotate residential proxy IP per crawl session | P0 |
+| CR-06 | Randomise request delay between 2 and 8 seconds per page | P0 |
+| CR-07 | Publish one raw event to `raw.jobs` per listing found | P0 |
+| CR-08 | Use `source:source_id` as the Kafka message key | P0 |
+| CR-09 | Enter exponential backoff (1s, 2s, 4s) after 3 consecutive page failures | P0 |
+| CR-10 | Alert via Sentry when a source has 0 successful listings over 1 hour | P1 |
+| CR-11 | Store last successful crawl timestamp per source in Redis | P1 |
+| CR-12 | Never block the entire crawl on a single failed page — skip and continue | P0 |
+
+### 3.4 Base Adapter Interface
+
+Every source adapter must implement:
+
+```python
+class BaseAdapter:
+    source: str                        # "naukri" | "foundit" | "internshala"
+
+    async def crawl(self) -> list[RawJob]:
+        raise NotImplementedError
+
+    async def parse_listing(self, page) -> RawJob:
+        raise NotImplementedError
+```
+
+### 3.5 Raw Job Schema (Kafka `raw.jobs`)
+
+```python
+class RawJob(BaseModel):
+    event_id: str           # uuid4
+    event_type: str         # "job.raw.crawled"
+    produced_at: datetime
+    source: str             # "naukri" | "foundit" | "internshala"
+    source_id: str          # platform-native job ID
+    crawled_at: datetime
+    url: str
+    raw: dict               # unmodified scraped fields
+```
+
+`raw` dict must contain at minimum: `title`, `company`, `location_raw`. All other fields are optional — ingestion handles missing fields.
+
+### 3.6 Celery Configuration
+
+```
+broker:           Redis
+result_backend:   Redis
+task_serializer:  json
+timezone:         Asia/Kolkata
+beat_schedule:
+  naukri:         every 4 hours
+  foundit:        every 6 hours
+  internshala:    every 12 hours
+```
+
+### 3.7 Environment Variables
+
+| Variable | Description |
+|---|---|
+| `KAFKA_BOOTSTRAP_SERVERS` | Kafka broker URL |
+| `KAFKA_API_KEY` | Upstash Kafka API key |
+| `KAFKA_API_SECRET` | Upstash Kafka API secret |
+| `REDIS_URL` | Redis connection URL |
+| `PROXY_HOST` | Residential proxy host |
+| `PROXY_USERNAME` | Proxy auth username |
+| `PROXY_PASSWORD` | Proxy auth password |
+| `SENTRY_DSN` | Sentry project DSN |
+
+---
+
+## 4. Ingestion / ETL Service
+
+### 4.1 Responsibilities
+
+- Consume raw events from Kafka `raw.jobs`
+- Normalise salary, skills, location, and dates
+- Deduplicate within source and across sources
+- Publish clean events to Kafka `clean.jobs`
+- Publish failed events to `raw.jobs.dlq` after max retries
+
+### 4.2 Dependencies
+
+```
+kafka-python
+pydantic
+spacy                  # NER for skill extraction from descriptions
+redis
+psycopg2-binary        # for cross-source dedup ground truth
+sentry-sdk
+```
+
+### 4.3 Functional Requirements
+
+| ID | Requirement | Priority |
+|---|---|---|
+| ET-01 | Normalise all salary formats to `{min: int, max: int, currency: "INR", period: "annual"}` | P0 |
+| ET-02 | Map skill variants to canonical form via lookup table | P0 |
+| ET-03 | Use spaCy NER to extract implicit skills from job description | P1 |
+| ET-04 | Geocode all location strings to `{city, state, lat, lng}` | P0 |
+| ET-05 | Resolve relative dates to absolute UTC timestamps | P0 |
+| ET-06 | Deduplicate by `source + source_id` (exact duplicate — skip) | P0 |
+| ET-07 | Deduplicate cross-source by `company + title + location` within 7-day window | P0 |
+| ET-08 | Use Redis bloom filter for fast first-pass dedup check | P1 |
+| ET-09 | Publish clean event to `clean.jobs` after successful normalisation | P0 |
+| ET-10 | Retry failed events up to 3 times with exponential backoff | P0 |
+| ET-11 | Publish failed events to `raw.jobs.dlq` after 3 failed attempts with error metadata | P0 |
+| ET-12 | Never crash the consumer loop on a single bad event — catch, DLQ, continue | P0 |
+| ET-13 | Expose Prometheus metrics endpoint for consumer lag and processing rate | P1 |
+
+### 4.4 Salary Normalisation Rules
+
+| Raw Format | Normalised |
+|---|---|
+| `12-18 Lacs PA` | `{min: 1200000, max: 1800000}` |
+| `₹50,000/month` | `{min: 600000, max: 600000}` |
+| `500000 per annum` | `{min: 500000, max: 500000}` |
+| `10-15 LPA` | `{min: 1000000, max: 1500000}` |
+| `Not Disclosed` / missing | `null` |
+
+### 4.5 Skills Canonical Map (Starter — Expand Over Time)
+
+| Raw Variants | Canonical |
+|---|---|
+| `React.js`, `ReactJS`, `React JS` | `React` |
+| `Node JS`, `NodeJS`, `Node.js` | `Node.js` |
+| `Postgres`, `PostgreSQL`, `psql` | `PostgreSQL` |
+| `ML`, `Machine Learning` | `Machine Learning` |
+| `JS`, `Javascript`, `JavaScript` | `JavaScript` |
+| `K8s`, `Kubernetes` | `Kubernetes` |
+| `AWS`, `Amazon Web Services` | `AWS` |
+
+### 4.6 Clean Job Schema (Kafka `clean.jobs`)
+
+```python
+class CleanJob(BaseModel):
+    event_id: str
+    event_type: str         # "job.clean.upserted"
+    produced_at: datetime
+    job: JobDocument
+
+class JobDocument(BaseModel):
+    id: str                 # uuid4 — stable across upserts
+    sources: list[str]
+    title: str
+    company: str
+    location: Location
+    salary: Salary | None
+    experience: ExperienceRange
+    skills: list[str]
+    description: str
+    job_type: str           # "full_time" | "contract" | "internship" | "remote"
+    posted_at: datetime
+    crawled_at: datetime
+    apply_url: str
+```
+
+### 4.7 DLQ Event Schema
+
+```python
+class DLQEvent(BaseModel):
+    original_event: RawJob
+    error: str              # exception message
+    service: str            # "ingestion-etl"
+    failed_at: datetime
+    attempt: int            # always 3 (max retries)
+```
+
+### 4.8 Environment Variables
+
+| Variable | Description |
+|---|---|
+| `KAFKA_BOOTSTRAP_SERVERS` | Kafka broker URL |
+| `KAFKA_API_KEY` | Upstash Kafka API key |
+| `KAFKA_API_SECRET` | Upstash Kafka API secret |
+| `KAFKA_CONSUMER_GROUP` | `ingestion-etl` |
+| `REDIS_URL` | Redis for bloom filter |
+| `DATABASE_URL` | PostgreSQL for dedup ground truth |
+| `SENTRY_DSN` | Sentry project DSN |
+
+---
+
+## 5. Recommendation Service
+
+### 5.1 Responsibilities
+
+- Expose gRPC endpoints for personalised recommendations and similar jobs
+- Retrieve candidate jobs from Search Service via gRPC
+- Re-rank candidates using skill embeddings, recency, behaviour, and popularity signals
+- Cache results per user in Redis
+
+### 5.2 Dependencies
+
+```
+fastapi
+grpcio
+grpcio-tools
+sentence-transformers
+scikit-learn
+numpy
+redis
+psycopg2-binary          # for behaviour signal (saved/applied jobs)
+sentry-sdk
+prometheus-fastapi-instrumentator
+```
+
+### 5.3 Functional Requirements
+
+| ID | Requirement | Priority |
+|---|---|---|
+| RC-01 | Expose `GetRecommendations(user_id, limit, offset)` via gRPC | P1 |
+| RC-02 | Expose `GetSimilarJobs(job_id, limit)` via gRPC | P1 |
+| RC-03 | Retrieve up to 200 candidate jobs from Search Service via gRPC | P1 |
+| RC-04 | Re-rank candidates using weighted score: 45% skill similarity + 25% recency + 20% behaviour + 10% popularity | P1 |
+| RC-05 | Generate user skill embeddings using `sentence-transformers/all-MiniLM-L6-v2` | P1 |
+| RC-06 | Generate job embeddings using title + top 5 skills | P1 |
+| RC-07 | Fall back to profile-based retrieval only for users with no behaviour history | P1 |
+| RC-08 | Cache recommendation results in Redis: key `rec:{user_id}:{page}`, TTL 30 minutes | P1 |
+| RC-09 | Invalidate cache when user saves or applies to a job | P1 |
+| RC-10 | Cache user embeddings in Redis: key `emb:{user_id}`, TTL 1 hour | P1 |
+| RC-11 | P95 latency on warm path (cache hit) must be < 300ms | P1 |
+| RC-12 | P95 latency on cold path (cache miss) must be < 600ms | P1 |
+
+### 5.4 Scoring Weights
+
+```python
+WEIGHTS = {
+    "skill_similarity": 0.45,
+    "recency":          0.25,
+    "behaviour":        0.20,
+    "popularity":       0.10,
+}
+```
+
+Recency score uses exponential decay: `score = e^(-days_since_posted / 14)`. A listing posted today scores 1.0; posted 14 days ago scores ~0.37.
+
+### 5.5 gRPC Contract
+
+Defined in `/proto/recommendation.proto`. Key messages:
+
+```proto
+service RecommendationService {
+  rpc GetRecommendations(RecommendationRequest) returns (RecommendationResponse);
+  rpc GetSimilarJobs(SimilarJobsRequest) returns (SimilarJobsResponse);
+}
+
+message RecommendationRequest {
+  string user_id = 1;
+  int32 limit = 2;
+  int32 offset = 3;
+}
+```
+
+Full proto definition lives in `/proto/recommendation.proto`. Generated Python stubs go in `recommendation/proto_generated/`.
+
+### 5.6 Environment Variables
+
+| Variable | Description |
+|---|---|
+| `SEARCH_SERVICE_GRPC_HOST` | Search Service gRPC host:port |
+| `REDIS_URL` | Redis for caching |
+| `DATABASE_URL` | PostgreSQL for behaviour signals |
+| `SENTRY_DSN` | Sentry project DSN |
+| `GRPC_PORT` | Port to expose gRPC server (default: 9003) |
+
+---
+
+## 6. Shared Module
+
+`shared/` contains code used across all three services.
+
+| File | Contents |
+|---|---|
+| `kafka_client.py` | Producer and consumer wrappers with retry logic |
+| `schemas.py` | Pydantic models: `RawJob`, `CleanJob`, `JobDocument`, `DLQEvent` |
+| `proto_generated/` | Generated gRPC stubs for `search.proto` |
+
+All services import from `shared/` via relative path. Do not duplicate schemas across services.
+
+---
+
+## 7. Kafka Topics
+
+| Topic | Producer | Consumer | Partitions | Retention |
+|---|---|---|---|---|
+| `raw.jobs` | Crawler | Ingestion/ETL | 6 | 7 days |
+| `clean.jobs` | Ingestion/ETL | Search Service (jder-core) | 6 | 14 days |
+| `raw.jobs.dlq` | Ingestion/ETL | Manual | 1 | 30 days |
+| `user.events` | User Service (jder-core) | Notification Service (jder-core) | 3 | 3 days |
+
+`jder-platform` produces to `raw.jobs` and `clean.jobs`. It does not produce to or consume from `user.events`.
+
+---
+
+## 8. Testing Requirements
+
+| Layer | Tool | Requirement |
+|---|---|---|
+| Unit | pytest | All normaliser functions must have unit tests with real-world raw format samples |
+| Integration | pytest + Testcontainers | Crawler → Kafka → Ingestion flow tested against a real Kafka container |
+| Contract | pydantic validation | Every event published to Kafka must pass schema validation before publish |
+| Performance | locust | Recommendation service cold path must sustain 50 req/s under 600ms p95 |
+
+CI runs unit and integration tests on every push. Performance tests run manually before release.
+
+---
+
+## 9. Local Development
+
+```bash
+# Start all infra (Kafka, Redis, Postgres, Elasticsearch)
+docker compose up -d
+
+# Run crawler locally (single manual trigger, no Celery)
+cd crawler && doppler run -- python -m crawler.tasks trigger_naukri
+
+# Run ingestion consumer
+cd ingestion && doppler run -- python -m ingestion.main
+
+# Run recommendation service
+cd recommendation && doppler run -- python -m recommendation.main
+```
+
+All secrets injected via Doppler CLI. No `.env` files.
